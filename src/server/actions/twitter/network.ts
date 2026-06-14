@@ -168,9 +168,10 @@ async function fetchTwitterNetwork(
       data.followers ?? data.followings ?? data.users ?? data.data ?? []
 
     // Normalize empty-string cursors to null. Some pagination APIs return
-    // "" instead of omitting the field; an empty-but-truthy cursor would
-    // either short-circuit caller loops or trigger endless first-page
-    // re-requests.
+    // "" instead of omitting the field, and an empty string is truthy
+    // enough to look like a valid cursor in caller loops, which then
+    // either silently halt the pagination (truthy check fails downstream)
+    // or hammer the API with the same first-page request forever.
     const rawCursor = typeof data.next_cursor === 'string' ? data.next_cursor : null
     const nextCursor = rawCursor && rawCursor.length > 0 ? rawCursor : null
 

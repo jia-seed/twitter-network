@@ -14,6 +14,7 @@ import {
   type TwitterScoredUser,
 } from '@/server/actions/twitter/score-types'
 import {
+  hashCriteria,
   listRuns,
   loadCachedScores,
   loadRun,
@@ -22,6 +23,16 @@ import {
   saveRun,
   type RunSummary,
 } from '@/lib/twitter-network/cache'
+import {
+  loadServerScores,
+  saveServerScores,
+} from '@/server/actions/twitter/server-scores'
+import {
+  listServerRuns,
+  loadServerRun,
+  removeServerRun,
+  saveServerRun,
+} from '@/server/actions/twitter/server-runs'
 
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts
@@ -93,7 +104,27 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 
 const MAX_AUTOLOAD_PAGES = 200 // ~40k accounts safety cap
-const SCORE_PARALLELISM = 4    // 4 Claude requests in flight at once
+// 6 in flight stays comfortably under Anthropic's default Haiku RPM/TPM
+// limits while running 50% more work concurrently than the prior 4.
+const SCORE_PARALLELISM = 6
+// Server-save delta gate. The Postgres jsonb payload is ~5 MB at 19k
+// followers; we don't want to push it every second during paging. Save
+// whenever the load grows by this many followers or when load finishes
+// (hasNext=false), whichever lands first.
+const SERVER_SAVE_DELTA_THRESHOLD = 2000
+// Followers with no bio at all cannot match any of the founder-shaped
+// criteria the page ships with — auto-score them client-side so we
+// don't waste Claude calls. For a typical 19k-follower account this
+// cuts 30-40% of the scoring queue.
+const SHORTCUT_SCORE_FOR_EMPTY_BIO: TwitterScoredUser = {
+  handle: '',
+  score: 0,
+  role: '—',
+  reason: 'No bio',
+}
+function shouldShortcutScore(u: { description: string }): boolean {
+  return (u.description ?? '').trim().length === 0
+}
 
 // Broad founder-detector. Hits the obvious roles, the chief-X-officer
 // long forms, the co-founder spellings, and the founder-adjacent verbs
@@ -158,6 +189,11 @@ export default function TwitterNetworkPage() {
   const [autoLoading, setAutoLoading] = useState(false)
   const [scoring, setScoring] = useState(false)
   const [scoredCount, setScoredCount] = useState(0)
+  // Running tally of how many of the in-progress run's scores came from
+  // the IDB / server cache vs cost a Claude call. Surfaces the cross-
+  // device cache value in the scoring status line.
+  const [cacheHitCount, setCacheHitCount] = useState(0)
+  const [claudeCallCount, setClaudeCallCount] = useState(0)
   const [scores, setScores] = useState<Map<string, TwitterScoredUser>>(new Map())
   const [presetId, setPresetId] = useState<string>('founders')
   const [criteria, setCriteria] = useState<string>(DEFAULT_FOUNDER_CRITERIA)
@@ -166,9 +202,24 @@ export default function TwitterNetworkPage() {
   const [error, setError] = useState<string | null>(null)
   const [runs, setRuns] = useState<RunSummary[]>([])
   const [cacheStatus, setCacheStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
+  // Set to `true` once IndexedDB has rejected a write hard enough that
+  // retrying isn't useful in this session (another tab is holding the
+  // older schema open, or the quota is genuinely exhausted). Suppresses
+  // the auto-save effect and the error banner; the page keeps working
+  // in memory and shows a small "session only" pill.
+  const [cacheDisabled, setCacheDisabled] = useState(false)
   const skipRestoreRef = useRef(false)
   const cancelRef = useRef(false)
   const scoringCancelRef = useRef(false)
+  // How many followers the server has for the active run. The auto-save
+  // effect uses this to decide whether the delta is big enough to
+  // justify another ~5 MB server write — we only push when load grows
+  // by SERVER_SAVE_DELTA_THRESHOLD or when the page hits a natural
+  // "settled" point (load complete, scoring finished). Reset whenever
+  // the active run changes so a different (handle, side) gets a fresh
+  // baseline.
+  const lastServerSavedLenRef = useRef(0)
+  const lastServerSavedKeyRef = useRef<string>('')
   const sentinelRef = useRef<HTMLDivElement | null>(null)
   // Ref-mirror of `side` so the one-click pipeline can flip "followers"
   // synchronously before kicking the fetch, even though the corresponding
@@ -267,30 +318,77 @@ export default function TwitterNetworkPage() {
     setError(null)
     setLastCriteriaUsed(criteria)
     scoringCancelRef.current = false
+    setCacheHitCount(0)
+    setClaudeCallCount(0)
 
     // Snapshot of current scores so we don't re-score people in a refresh.
     const alreadyScored = new Set(scores.keys())
     const todo = users.filter((u) => !alreadyScored.has(u.userName))
     const newScores = new Map(scores)
 
-    // Apply any globally-cached scores up front so Claude only sees the
-    // genuine misses. Hugely cheaper on a second run of the same
-    // criteria across overlapping follower sets.
-    const cachedHits = await loadCachedScores(
-      criteria,
-      todo.map((u) => u.userName),
-    )
-    const claudeTodo = todo.filter((u) => {
-      const hit = cachedHits.get(u.userName)
+    // Empty-bio followers can't match any of the founder-shaped criteria
+    // the page ships with — skip Claude and auto-score them 0. For a
+    // typical 19k-follower run this drops the queue by 30-40% before
+    // anything hits the network.
+    const claudeCandidates: TwitterNetworkUser[] = []
+    for (const u of todo) {
+      if (shouldShortcutScore(u)) {
+        newScores.set(u.userName, {
+          ...SHORTCUT_SCORE_FOR_EMPTY_BIO,
+          handle: u.userName,
+        })
+      } else {
+        claudeCandidates.push(u)
+      }
+    }
+
+    // Apply IDB + server cache hits before sending anything to Claude.
+    // Server hits give cross-device durability; IDB gives instant local
+    // reads. Run both in parallel and union the results.
+    const handlesToCheck = claudeCandidates.map((u) => u.userName)
+    const critHashEarly = await hashCriteria(criteria)
+    const [idbHitsAll, serverRowsAll] = await Promise.all([
+      loadCachedScores(criteria, handlesToCheck),
+      loadServerScores(critHashEarly, handlesToCheck),
+    ])
+    const serverByHandleAll = new Map<string, TwitterScoredUser>()
+    for (const row of serverRowsAll) {
+      const original = claudeCandidates.find(
+        (u) => u.userName.toLowerCase() === row.handle.toLowerCase(),
+      )?.userName
+      if (original) {
+        serverByHandleAll.set(original, {
+          handle: original,
+          score: row.score,
+          role: row.role,
+          reason: row.reason,
+        })
+      }
+    }
+    const idbBackfillAll = new Map<string, TwitterScoredUser>()
+    const claudeTodo = claudeCandidates.filter((u) => {
+      const hit = idbHitsAll.get(u.userName) ?? serverByHandleAll.get(u.userName)
       if (hit) {
         newScores.set(u.userName, hit)
+        if (!idbHitsAll.has(u.userName) && serverByHandleAll.has(u.userName)) {
+          idbBackfillAll.set(u.userName, hit)
+        }
         return false
       }
       return true
     })
-    if (cachedHits.size > 0) {
+    if (idbHitsAll.size > 0 || serverByHandleAll.size > 0) {
       setScores(new Map(newScores))
       setScoredCount(newScores.size)
+      // Each unique handle resolved from either cache layer counts once.
+      const unionHits = new Set<string>([
+        ...idbHitsAll.keys(),
+        ...serverByHandleAll.keys(),
+      ])
+      setCacheHitCount(unionHits.size)
+    }
+    if (idbBackfillAll.size > 0) {
+      void saveCachedScores(criteria, idbBackfillAll)
     }
 
     // Pack remaining (Claude-bound) work into batches.
@@ -343,7 +441,20 @@ export default function TwitterNetworkPage() {
           }
           setScores(new Map(newScores))
           setScoredCount(newScores.size)
+          setClaudeCallCount((n) => n + justScored.size)
           void saveCachedScores(criteria, justScored)
+          void (async () => {
+            const critHash = await hashCriteria(criteria)
+            await saveServerScores(
+              critHash,
+              Array.from(justScored.values()).map((s) => ({
+                handle: s.handle,
+                score: s.score,
+                role: s.role,
+                reason: s.reason,
+              })),
+            )
+          })()
         }
       },
     )
@@ -357,6 +468,72 @@ export default function TwitterNetworkPage() {
 
   const cancelScoring = () => {
     scoringCancelRef.current = true
+  }
+
+  /**
+   * Snapshot every scored follower as a CSV the user can save to disk.
+   * Rows sorted high-score-first so the file opens with the best
+   * matches at the top. Bios are flattened to single-line so spreadsheet
+   * apps don't break rows on embedded newlines.
+   */
+  const downloadScoredCsv = () => {
+    if (scores.size === 0) return
+    const header = [
+      'handle',
+      'name',
+      'score',
+      'role',
+      'reason',
+      'bio',
+      'followers',
+      'following',
+      'location',
+      'url',
+      'verified',
+    ]
+    type Row = (string | number)[]
+    const dataRows: Row[] = []
+    for (const u of users) {
+      const s = scores.get(u.userName)
+      if (!s) continue
+      dataRows.push([
+        u.userName,
+        u.name,
+        s.score,
+        s.role,
+        s.reason,
+        (u.description ?? '').replace(/\s+/g, ' ').trim(),
+        u.followers,
+        u.following,
+        u.location ?? '',
+        u.url ?? '',
+        u.isVerified || u.isBlueVerified ? 'yes' : 'no',
+      ])
+    }
+    dataRows.sort((a, b) => Number(b[2]) - Number(a[2]))
+    const escape = (cell: string | number): string => {
+      const s = String(cell ?? '')
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+    }
+    const csv = [header, ...dataRows]
+      .map((row) => row.map(escape).join(','))
+      .join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    const safeHandle = (handle || 'export')
+      .replace(/[^a-z0-9_-]/gi, '_')
+      .toLowerCase()
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, '-')
+      .slice(0, 19)
+    a.download = `twitter-network-${safeHandle}-${side}-${stamp}.csv`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
   }
 
   /**
@@ -385,6 +562,9 @@ export default function TwitterNetworkPage() {
     scoringCancelRef.current = false
     setError(null)
     setLastCriteriaUsed(criteria)
+    // Reset the run-scoped tally so the progress line starts at zero.
+    setCacheHitCount(0)
+    setClaudeCallCount(0)
 
     // Seed in-memory mirrors from whatever the page already has. These
     // are the source of truth for the streaming pipeline; we still
@@ -430,6 +610,49 @@ export default function TwitterNetworkPage() {
       setHasNext(true)
     }
 
+    // Route the source profile through the same cache → queue path as
+    // followers so the user's own score shows up alongside theirs. Runs
+    // after the suspicion check so its score isn't wiped along with
+    // stale follower data. Empty bio → instant zero shortcut; IDB or
+    // server cache hit → applied immediately; otherwise queued at the
+    // front so a fresh score lands before the long follower tail.
+    if (liveSourceUser && !scoresByHandle.has(liveSourceUser.userName)) {
+      const srcHandle = liveSourceUser.userName
+      if (shouldShortcutScore(liveSourceUser)) {
+        scoresByHandle.set(srcHandle, {
+          ...SHORTCUT_SCORE_FOR_EMPTY_BIO,
+          handle: srcHandle,
+        })
+        setScores(new Map(scoresByHandle))
+      } else {
+        const critHash = await hashCriteria(criteria)
+        const [idbHits, serverHits] = await Promise.all([
+          loadCachedScores(criteria, [srcHandle]),
+          loadServerScores(critHash, [srcHandle]),
+        ])
+        const idbHit = idbHits.get(srcHandle)
+        const serverHit = serverHits.find(
+          (r) => r.handle.toLowerCase() === srcHandle.toLowerCase(),
+        )
+        if (idbHit) {
+          scoresByHandle.set(srcHandle, idbHit)
+          setScores(new Map(scoresByHandle))
+        } else if (serverHit) {
+          const hit: TwitterScoredUser = {
+            handle: srcHandle,
+            score: serverHit.score,
+            role: serverHit.role,
+            reason: serverHit.reason,
+          }
+          scoresByHandle.set(srcHandle, hit)
+          setScores(new Map(scoresByHandle))
+          void saveCachedScores(criteria, new Map([[srcHandle, hit]]))
+        } else {
+          queue.unshift(liveSourceUser)
+        }
+      }
+    }
+
     setLoading(true)
     setAutoLoading(true)
 
@@ -455,13 +678,29 @@ export default function TwitterNetworkPage() {
         }
         let added = 0
         const newCandidates: TwitterNetworkUser[] = []
+        let shortcutHits = 0
         for (const u of result.users) {
           if (!u.userName) continue
           const key = u.userName.toLowerCase()
           if (usersByHandle.has(key)) continue
           usersByHandle.set(key, u)
-          if (!scoresByHandle.has(u.userName)) newCandidates.push(u)
+          if (!scoresByHandle.has(u.userName)) {
+            if (shouldShortcutScore(u)) {
+              // Auto-score empty-bio followers without calling Claude.
+              scoresByHandle.set(u.userName, {
+                ...SHORTCUT_SCORE_FOR_EMPTY_BIO,
+                handle: u.userName,
+              })
+              shortcutHits++
+            } else {
+              newCandidates.push(u)
+            }
+          }
           added++
+        }
+        if (shortcutHits > 0) {
+          setScores(new Map(scoresByHandle))
+          setScoredCount(scoresByHandle.size)
         }
         // Snapshot for the UI. Cheap to re-create an array from the map
         // every page; rendering is virtualized by browser scrolling.
@@ -469,20 +708,47 @@ export default function TwitterNetworkPage() {
         setCursor(result.nextCursor)
         setHasNext(result.hasNextPage)
         pages++
-        // Consult the global score cache before queueing for Claude.
-        // Any handle scored in a previous run under the same criteria is
-        // applied here for free, skipping the queue entirely.
+        // Consult both the local (IDB) score cache and the per-user
+        // server score table before queueing for Claude. Either hit
+        // applies the cached score for free; only genuine misses go to
+        // the queue. Server hits give us cross-device durability — a
+        // score paid for in one browser shows up in another the next
+        // time the same criteria is run.
         if (newCandidates.length > 0) {
-          const cachedHits = await loadCachedScores(
-            criteria,
-            newCandidates.map((u) => u.userName),
-          )
+          const handlesToCheck = newCandidates.map((u) => u.userName)
+          const critHash = await hashCriteria(criteria)
+          const [idbHits, serverRows] = await Promise.all([
+            loadCachedScores(criteria, handlesToCheck),
+            loadServerScores(critHash, handlesToCheck),
+          ])
+          // Map server rows back to original handle casing (server stores
+          // lowercase; rest of the page keys by the original casing).
+          const serverByHandle = new Map<string, TwitterScoredUser>()
+          for (const row of serverRows) {
+            const original = newCandidates.find(
+              (u) => u.userName.toLowerCase() === row.handle.toLowerCase(),
+            )?.userName
+            if (original) {
+              serverByHandle.set(original, {
+                handle: original,
+                score: row.score,
+                role: row.role,
+                reason: row.reason,
+              })
+            }
+          }
           let hits = 0
+          const idbMissesNeedingBackfill = new Map<string, TwitterScoredUser>()
           for (const u of newCandidates) {
-            const hit = cachedHits.get(u.userName)
+            const hit = idbHits.get(u.userName) ?? serverByHandle.get(u.userName)
             if (hit) {
               scoresByHandle.set(u.userName, hit)
               hits++
+              // If only the server had it, warm the IDB cache so the
+              // next session reads it locally without a round-trip.
+              if (!idbHits.has(u.userName) && serverByHandle.has(u.userName)) {
+                idbMissesNeedingBackfill.set(u.userName, hit)
+              }
             } else {
               queue.push(u)
             }
@@ -490,6 +756,10 @@ export default function TwitterNetworkPage() {
           if (hits > 0) {
             setScores(new Map(scoresByHandle))
             setScoredCount(scoresByHandle.size)
+            setCacheHitCount((n) => n + hits)
+          }
+          if (idbMissesNeedingBackfill.size > 0) {
+            void saveCachedScores(criteria, idbMissesNeedingBackfill)
           }
         }
         // End conditions: no cursor, API said done, or a full page of
@@ -551,10 +821,24 @@ export default function TwitterNetworkPage() {
           }
           setScores(new Map(scoresByHandle))
           setScoredCount(scoresByHandle.size)
-          // Persist to the global score cache so subsequent runs (even
-          // for different source accounts) reuse this score under the
-          // same criteria.
+          setClaudeCallCount((n) => n + justScored.size)
+          // Persist to BOTH the local IDB cache (instant local reads on
+          // reload) and the per-user server table (durable across
+          // devices). Fire-and-forget — the in-memory map is already
+          // updated, so a failed save doesn't block UI progress.
           void saveCachedScores(criteria, justScored)
+          void (async () => {
+            const critHash = await hashCriteria(criteria)
+            await saveServerScores(
+              critHash,
+              Array.from(justScored.values()).map((s) => ({
+                handle: s.handle,
+                score: s.score,
+                role: s.role,
+                reason: s.reason,
+              })),
+            )
+          })()
         }
       },
     )
@@ -595,10 +879,39 @@ export default function TwitterNetworkPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasNext, loading, autoLoading])
 
-  // Load the list of cached runs once on mount so the "Recent runs"
-  // panel can populate.
+  // Load the recent-runs list on mount. Merge local IDB + per-user
+  // server runs so cross-device runs surface as long as the user is
+  // signed in. Dedupe on (handle, side); keep the freshest by
+  // updatedAt.
   useEffect(() => {
-    void listRuns().then(setRuns)
+    void (async () => {
+      const [local, server] = await Promise.all([
+        listRuns(),
+        listServerRuns(),
+      ])
+      const merged = new Map<string, RunSummary>()
+      for (const r of local) {
+        merged.set(`${r.side}:${r.handle.toLowerCase()}`, r)
+      }
+      for (const r of server) {
+        const key = `${r.side}:${r.handle.toLowerCase()}`
+        const existing = merged.get(key)
+        if (!existing || r.updatedAt > existing.updatedAt) {
+          merged.set(key, {
+            handle: r.handle,
+            side: r.side,
+            userCount: r.userCount,
+            // Server doesn't track scoredCount in this table; fall back
+            // to whatever IDB had so the row still looks right.
+            scoredCount: existing?.scoredCount ?? 0,
+            updatedAt: r.updatedAt,
+          })
+        }
+      }
+      setRuns(
+        Array.from(merged.values()).sort((a, b) => b.updatedAt - a.updatedAt),
+      )
+    })()
   }, [])
 
   // Auto-save: 1s after any state change to users / scores / cursor /
@@ -609,37 +922,73 @@ export default function TwitterNetworkPage() {
   useEffect(() => {
     const normalized = normalizeForCache(handle)
     if (!normalized || users.length === 0) return
-    setCacheStatus('saving')
-    const t = setTimeout(() => {
-      void saveRun({
+
+    // IDB write (always tried unless cache is disabled). Cheap and
+    // fast — runs every settled state change.
+    let idbTimeout: ReturnType<typeof setTimeout> | undefined
+    if (!cacheDisabled) {
+      setCacheStatus('saving')
+      idbTimeout = setTimeout(() => {
+        void saveRun({
+          handle: normalized,
+          side,
+          sourceUser,
+          users,
+          scores: Array.from(scores.entries()),
+          cursor,
+          hasNext,
+          criteriaUsed: lastCriteriaUsed,
+          updatedAt: Date.now(),
+        }).then((result) => {
+          if (result.ok) {
+            setCacheStatus('saved')
+            void listRuns().then(setRuns)
+          } else {
+            setCacheStatus('idle')
+            setCacheDisabled(true)
+          }
+        })
+      }, 1000)
+    }
+
+    // Server write — coarser cadence. Only push when the delta is big
+    // enough or the load just settled (hasNext=false), so a 19k run
+    // emits ~10 saves total instead of ~hundreds.
+    const runKey = `${normalized}:${side}`
+    if (runKey !== lastServerSavedKeyRef.current) {
+      lastServerSavedLenRef.current = 0
+      lastServerSavedKeyRef.current = runKey
+    }
+    const delta = users.length - lastServerSavedLenRef.current
+    const loadFinished = !hasNext && users.length > 0
+    const shouldServerSave =
+      delta >= SERVER_SAVE_DELTA_THRESHOLD || loadFinished
+    let serverTimeout: ReturnType<typeof setTimeout> | undefined
+    if (shouldServerSave) {
+      const snapshot = {
         handle: normalized,
         side,
         sourceUser,
         users,
-        scores: Array.from(scores.entries()),
         cursor,
         hasNext,
         criteriaUsed: lastCriteriaUsed,
-        updatedAt: Date.now(),
-      }).then((result) => {
-        if (result.ok) {
-          setCacheStatus('saved')
-          void listRuns().then(setRuns)
-        } else {
-          setCacheStatus('idle')
-          if (result.error) {
-            const isBlocked = result.error.toLowerCase().includes('blocked')
-            setError(
-              isBlocked
-                ? 'Another tab of /twitter-network is holding the cache open at an older schema. Close it and reload this tab to unblock.'
-                : `Couldn't cache this run: ${result.error}. Current session keeps working in memory.`,
-            )
+      }
+      const snapshotLen = users.length
+      serverTimeout = setTimeout(() => {
+        void saveServerRun(snapshot).then((result) => {
+          if (result.ok) {
+            lastServerSavedLenRef.current = snapshotLen
           }
-        }
-      })
-    }, 1000)
-    return () => clearTimeout(t)
-  }, [handle, side, users, scores, cursor, hasNext, sourceUser, lastCriteriaUsed])
+        })
+      }, 1500)
+    }
+
+    return () => {
+      if (idbTimeout) clearTimeout(idbTimeout)
+      if (serverTimeout) clearTimeout(serverTimeout)
+    }
+  }, [handle, side, users, scores, cursor, hasNext, sourceUser, lastCriteriaUsed, cacheDisabled])
 
   // Auto-restore when the typed handle matches a cached run AND the
   // user hasn't already loaded something for that handle. Suppressed
@@ -652,21 +1001,70 @@ export default function TwitterNetworkPage() {
     const normalized = normalizeForCache(handle)
     if (!normalized) return
     let cancelled = false
-    void loadRun(normalized, side).then((cached) => {
-      if (cancelled || !cached) return
-      setUsers(cached.users)
-      setScores(new Map(cached.scores))
-      setSourceUser(cached.sourceUser)
-      setCursor(cached.cursor)
-      setHasNext(cached.hasNext)
-      setLastCriteriaUsed(cached.criteriaUsed)
-      setScoredCount(cached.scores.length)
-      // If the cached run already has scores, default to showing the best
-      // first — that's the natural "show me the best followers" view the
-      // user expects when they reopen a scored run. They can still flip
-      // back to original order via the sort checkbox.
-      if (cached.scores.length > 0) setSortBy('score')
-    })
+    void (async () => {
+      // Query the local IDB cache and the server in parallel. Prefer
+      // whichever is fresher (higher updatedAt) — the server wins
+      // cross-device, the IDB wins instantly on the same machine.
+      // Scores from the IDB cache (if present) get merged with whatever
+      // the server has via the existing score-cache pipeline; the
+      // restored users[] determines what's visible.
+      const [idb, server] = await Promise.all([
+        loadRun(normalized, side),
+        loadServerRun(normalized, side),
+      ])
+      if (cancelled) return
+      let chosen:
+        | {
+            users: TwitterNetworkUser[]
+            scores: Array<[string, TwitterScoredUser]>
+            sourceUser: TwitterNetworkUser | null
+            cursor: string | null
+            hasNext: boolean
+            criteriaUsed: string | null
+          }
+        | null = null
+      if (idb && server) {
+        // Both exist — take the bigger or fresher one.
+        const idbSize = idb.users.length
+        const serverSize = server.users.length
+        if (serverSize > idbSize || server.updatedAt > idb.updatedAt) {
+          chosen = {
+            users: server.users,
+            scores: idb.scores, // server scores live in twitter_network_scores; surface those via the score cache pipeline
+            sourceUser: server.sourceUser,
+            cursor: server.cursor,
+            hasNext: server.hasNext,
+            criteriaUsed: server.criteriaUsed,
+          }
+        } else {
+          chosen = idb
+        }
+      } else if (server) {
+        chosen = {
+          users: server.users,
+          scores: [],
+          sourceUser: server.sourceUser,
+          cursor: server.cursor,
+          hasNext: server.hasNext,
+          criteriaUsed: server.criteriaUsed,
+        }
+      } else if (idb) {
+        chosen = idb
+      }
+      if (!chosen) return
+      setUsers(chosen.users)
+      setScores(new Map(chosen.scores))
+      setSourceUser(chosen.sourceUser)
+      setCursor(chosen.cursor)
+      setHasNext(chosen.hasNext)
+      setLastCriteriaUsed(chosen.criteriaUsed)
+      setScoredCount(chosen.scores.length)
+      // Anchor the server-save delta tracker so the next save only fires
+      // once we've actually grown the list beyond what's already saved.
+      lastServerSavedLenRef.current = chosen.users.length
+      lastServerSavedKeyRef.current = `${normalized}:${side}`
+      if (chosen.scores.length > 0) setSortBy('score')
+    })()
     return () => {
       cancelled = true
     }
@@ -718,9 +1116,19 @@ export default function TwitterNetworkPage() {
   return (
     <div className="mx-auto max-w-5xl space-y-6 p-8">
       <div className="space-y-2">
-        <h1 className="text-foreground text-3xl leading-tight font-light sm:text-4xl">
-          Twitter network
-        </h1>
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <h1 className="text-foreground text-3xl leading-tight font-light sm:text-4xl">
+            Twitter network
+          </h1>
+          {cacheDisabled && (
+            <span
+              className="text-muted-foreground border-border rounded-full border px-2 py-0.5 text-xs font-light"
+              title="Another tab of this page is holding the cache open, or storage is full. Session keeps working in memory; close other tabs and reload to re-enable persistence."
+            >
+              session only
+            </span>
+          )}
+        </div>
         <p className="text-muted-foreground max-w-2xl text-base font-light">
           Pull the followers of any Twitter account via twitterapi.io. Filter the
           list locally for founders / CEOs.
@@ -733,11 +1141,18 @@ export default function TwitterNetworkPage() {
             <span className="text-muted-foreground text-xs font-light">
               Recent runs
             </span>
-            {cacheStatus !== 'idle' && (
-              <span className="text-muted-foreground text-xs">
+            {cacheDisabled ? (
+              <span
+                className="text-muted-foreground text-xs font-light"
+                title="Another tab of this page is holding the cache open, or storage is full. Session keeps working in memory; close other tabs and reload to re-enable persistence."
+              >
+                session only
+              </span>
+            ) : cacheStatus !== 'idle' ? (
+              <span className="text-muted-foreground text-xs font-light">
                 {cacheStatus === 'saving' ? 'Saving...' : 'Saved'}
               </span>
-            )}
+            ) : null}
           </div>
           <div className="flex flex-wrap gap-2">
             {runs.slice(0, 12).map((r) => (
@@ -771,9 +1186,37 @@ export default function TwitterNetworkPage() {
                   type="button"
                   aria-label="Forget this run"
                   onClick={() => {
-                    void removeRun(r.handle, r.side).then(() =>
-                      listRuns().then(setRuns),
-                    )
+                    void Promise.all([
+                      removeRun(r.handle, r.side),
+                      removeServerRun(r.handle, r.side),
+                    ]).then(async () => {
+                      const [local, server] = await Promise.all([
+                        listRuns(),
+                        listServerRuns(),
+                      ])
+                      const merged = new Map<string, RunSummary>()
+                      for (const x of local) {
+                        merged.set(`${x.side}:${x.handle.toLowerCase()}`, x)
+                      }
+                      for (const x of server) {
+                        const k = `${x.side}:${x.handle.toLowerCase()}`
+                        const existing = merged.get(k)
+                        if (!existing || x.updatedAt > existing.updatedAt) {
+                          merged.set(k, {
+                            handle: x.handle,
+                            side: x.side,
+                            userCount: x.userCount,
+                            scoredCount: existing?.scoredCount ?? 0,
+                            updatedAt: x.updatedAt,
+                          })
+                        }
+                      }
+                      setRuns(
+                        Array.from(merged.values()).sort(
+                          (a, b) => b.updatedAt - a.updatedAt,
+                        ),
+                      )
+                    })
                   }}
                   className="text-muted-foreground hover:text-foreground"
                 >
@@ -935,11 +1378,23 @@ export default function TwitterNetworkPage() {
             />
           )}
           <div className="min-w-0 flex-1">
-            <div className="flex items-baseline gap-2">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
               <span className="text-foreground font-light">{sourceUser.name}</span>
               <span className="text-muted-foreground text-sm font-light">
                 @{sourceUser.userName}
               </span>
+              {(() => {
+                const s = scores.get(sourceUser.userName)
+                if (!s) return null
+                return (
+                  <span
+                    className="border-border text-foreground rounded-full border bg-transparent px-2 py-0.5 text-xs font-light"
+                    title={s.reason}
+                  >
+                    {s.score} · {s.role || 'unrated'}
+                  </span>
+                )
+              })()}
             </div>
             <div className="text-muted-foreground mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs font-light">
               <span>
@@ -979,10 +1434,29 @@ export default function TwitterNetworkPage() {
               Cancel scoring ({scoredCount.toLocaleString()} / {users.length.toLocaleString()})
             </Button>
           )}
+          {scores.size > 0 && !scoring && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={downloadScoredCsv}
+              title="Saves handle, name, score, role, reason, bio, followers, and location to a CSV file."
+            >
+              Download CSV ({scores.size.toLocaleString()} scored)
+            </Button>
+          )}
           {scoring && (
-            <span className="text-muted-foreground text-xs">
+            <span className="text-muted-foreground text-xs font-light">
               Claude Haiku, batches of {TWITTER_SCORE_BATCH_SIZE},{' '}
               {SCORE_PARALLELISM} in flight
+              {cacheHitCount > 0 || claudeCallCount > 0
+                ? ` · ${cacheHitCount.toLocaleString()} from cache, ${claudeCallCount.toLocaleString()} via Claude`
+                : ''}
+            </span>
+          )}
+          {!scoring && (cacheHitCount > 0 || claudeCallCount > 0) && (
+            <span className="text-muted-foreground text-xs font-light">
+              This run: {cacheHitCount.toLocaleString()} from cache,{' '}
+              {claudeCallCount.toLocaleString()} via Claude
             </span>
           )}
         </div>

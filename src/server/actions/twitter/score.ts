@@ -1,6 +1,7 @@
 'use server'
 
 import Anthropic from '@anthropic-ai/sdk'
+
 import {
   DEFAULT_FOUNDER_CRITERIA,
   TWITTER_SCORE_BATCH_SIZE,
@@ -10,9 +11,15 @@ import {
 } from './score-types'
 
 /**
- * Score a batch of (up to TWITTER_SCORE_BATCH_SIZE) Twitter profiles
- * against the caller-supplied criteria using Claude Haiku 4.5. Returns
- * one record per profile in input order — caller maps back by handle.
+ * Score a batch of (up to TWITTER_SCORE_BATCH_SIZE) Twitter profiles for
+ * importance + credibility using Claude Haiku. Returns one score (0-100)
+ * per profile with a one-line reason and a short role label. Returns the
+ * scores in the same order as input — the caller maps back by handle.
+ *
+ * Why Haiku: this is a quick classification job over ~150 tokens of
+ * profile context; opus/sonnet would be overkill and 5-10x more
+ * expensive. Haiku 4.5 nails the "important professional vs random"
+ * judgment reliably for the price.
  */
 export async function scoreTwitterUsers(
   users: TwitterScoreInput[],
@@ -42,6 +49,9 @@ export async function scoreTwitterUsers(
     })),
   )
 
+  // The user-supplied criteria is treated as the "what to look for"
+  // instructions for Claude. We still impose the 0-100 + JSON-only
+  // structural rules so the caller can parse the response uniformly.
   const criteriaBlock = (criteria ?? '').trim() || DEFAULT_FOUNDER_CRITERIA
 
   const prompt = `You are scoring Twitter profiles against a user-provided target.
@@ -60,7 +70,7 @@ SCORING:
 - 20-39  = wrong category but a real career.
 - 0-19   = not the target at all.
 - High follower count or legacy verification do NOT save a profile that
-  is not the target. Fame is not the criterion.
+  is not the target. Fame is not the criterion — the user's criterion is.
 
 THE "role" FIELD: be specific. Name the company and the person's role at
 it. "Co-founder, Hugging Face" beats "AI founder". If the profile is
@@ -87,9 +97,12 @@ ${profilesJson}`
     }
 
     let raw = textBlock.text.trim()
+    // Tolerate occasional markdown fence wrapping.
     if (raw.startsWith('```')) {
       raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim()
     }
+    // Sometimes the model prefaces with a sentence; grab the first [...]
+    // block defensively.
     const firstBracket = raw.indexOf('[')
     const lastBracket = raw.lastIndexOf(']')
     if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
@@ -125,7 +138,6 @@ ${profilesJson}`
 
     return { success: true, scores }
   } catch (e) {
-    console.error('[scoreTwitterUsers]', e)
     return { success: false, error: e instanceof Error ? e.message : 'Unknown Claude error' }
   }
 }

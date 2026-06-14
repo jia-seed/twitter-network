@@ -263,10 +263,14 @@ export async function removeRun(
  * across 50k unique handles still fits comfortably in IDB.
  */
 
-async function hashCriteria(criteria: string): Promise<string> {
-  // SHA-256 truncated to 16 hex chars (64 bits). Collision probability
-  // is negligible for the order-of-millions distinct criteria strings
-  // any one user will ever write. Web Crypto is sync-fast (~1ms).
+/**
+ * SHA-256 of the (trimmed) criteria text, truncated to 16 hex chars (64
+ * bits). Stable across browsers + the server. Used as the cache key for
+ * both the local IDB scores store and the server-side per-user scores
+ * table, so a score written from one tab is found from another or from
+ * a different device under the same criteria.
+ */
+export async function hashCriteria(criteria: string): Promise<string> {
   const enc = new TextEncoder().encode(criteria.trim())
   const buf = await crypto.subtle.digest('SHA-256', enc)
   return Array.from(new Uint8Array(buf))

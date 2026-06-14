@@ -6,7 +6,7 @@
 #   JAM_REPO=../jam ./scripts/sync-from-jam.sh
 #   JAM_REPO=/abs/path/to/jam ./scripts/sync-from-jam.sh
 #
-# Defaults to ../jam relative to this script's parent directory.
+# Defaults to ../jam relative to this repo's parent directory.
 
 set -euo pipefail
 
@@ -20,38 +20,53 @@ fi
 
 echo "syncing from $JAM_REPO -> $HERE"
 
-# Direct file-by-file copy. Any change to the structure of the upstream
-# slice (new file, renamed dir) requires editing this list.
+# Plain copies — these files have no Jam-internal dependencies.
 cp "$JAM_REPO/src/lib/twitter-network/cache.ts" \
    "$HERE/src/lib/twitter-network/cache.ts"
-
-cp "$JAM_REPO/src/server/actions/twitter/network.ts" \
-   "$HERE/src/server/actions/twitter/network.ts"
 
 cp "$JAM_REPO/src/server/actions/twitter/score-types.ts" \
    "$HERE/src/server/actions/twitter/score-types.ts"
 
-# These two need find/replace because upstream uses internal helpers
-# that don't exist in this repo. Keep edits minimal; if the upstream
-# diverges further, just port by hand.
-#
-#   1. score.ts: getAnthropicClient() -> new Anthropic(...)
-#   2. score.ts: captureActionError(...) -> console.error(...)
-#   3. network.ts: captureActionError(...) -> console.error(...)
-sed -e "s|import { getAnthropicClient } from '@/lib/ai/client'|import Anthropic from '@anthropic-ai/sdk'|" \
-    -e "s|import { captureActionError } from '@/lib/sentry'||" \
-    -e "s|const anthropic = getAnthropicClient()|const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })|" \
-    -e "/captureActionError(/,/})/d" \
-    "$JAM_REPO/src/server/actions/twitter/score.ts" \
-  > "$HERE/src/server/actions/twitter/score.ts"
-
-sed -e "s|import { captureActionError } from '@/lib/sentry'||" \
-    -e "/captureActionError(/,/})/d" \
-    "$JAM_REPO/src/server/actions/twitter/network.ts" \
-  > "$HERE/src/server/actions/twitter/network.ts"
-
-# Page lives at /twitter-network in jam, at / in this repo.
 cp "$JAM_REPO/src/app/twitter-network/page.tsx" \
    "$HERE/src/app/page.tsx"
+
+# score.ts needs two replacements:
+#   - import { getAnthropicClient } -> import Anthropic from '@anthropic-ai/sdk'
+#   - drop the @/lib/sentry import + every captureActionError(...) call
+# Done with python (regex with proper multi-line handling — sed multi-line
+# replace was eating downstream blocks).
+python3 - "$JAM_REPO/src/server/actions/twitter/score.ts" \
+            "$HERE/src/server/actions/twitter/score.ts" <<'PY'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+text = text.replace(
+    "import { getAnthropicClient } from '@/lib/ai/client'",
+    "import Anthropic from '@anthropic-ai/sdk'",
+)
+text = re.sub(r"^import \{ captureActionError \} from '@/lib/sentry'\s*\n", '', text, flags=re.M)
+text = text.replace(
+    "const anthropic = getAnthropicClient()",
+    "const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })",
+)
+text = re.sub(r"^\s*captureActionError\([^)]*\)\s*\n", '', text, flags=re.M)
+text = re.sub(r"^\s*captureActionError\(\s*\n(?:[^\n]*\n)*?\s*\}\)\s*\n", '', text, flags=re.M)
+open(dst, 'w').write(text)
+PY
+
+# network.ts: just drop the @/lib/sentry import + captureActionError calls.
+python3 - "$JAM_REPO/src/server/actions/twitter/network.ts" \
+            "$HERE/src/server/actions/twitter/network.ts" <<'PY'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+text = re.sub(r"^import \{ captureActionError \} from '@/lib/sentry'\s*\n", '', text, flags=re.M)
+text = re.sub(r"^\s*captureActionError\([^)]*\)\s*\n", '', text, flags=re.M)
+text = re.sub(r"^\s*captureActionError\(\s*\n(?:[^\n]*\n)*?\s*\}\)\s*\n", '', text, flags=re.M)
+open(dst, 'w').write(text)
+PY
+
+# DO NOT copy server-runs.ts / server-scores.ts — those are intentional
+# stubs in this repo (no DB). The page imports them but only no-ops run.
 
 echo "done. review with: git diff"
