@@ -1,7 +1,6 @@
 'use server'
 
 import Anthropic from '@anthropic-ai/sdk'
-
 import {
   DEFAULT_FOUNDER_CRITERIA,
   TWITTER_SCORE_BATCH_SIZE,

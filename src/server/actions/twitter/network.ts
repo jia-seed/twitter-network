@@ -93,6 +93,8 @@ export async function fetchTwitterUserInfo(
       return { success: false, error: `twitterapi.io ${res.status}: ${body.slice(0, 200) || res.statusText}` }
     }
     const data = (await res.json()) as { data?: RawUser; user?: RawUser } & RawUser
+    // twitterapi.io's user-info endpoint puts the body either inline or under
+    // `data` / `user` depending on the route version; tolerate both.
     const raw = (data.data ?? data.user ?? (data as RawUser)) as RawUser
     if (!raw || (typeof raw === 'object' && Object.keys(raw).length === 0)) {
       return { success: false, error: 'User not found.' }
@@ -102,7 +104,6 @@ export async function fetchTwitterUserInfo(
     if (e instanceof Error && e.name === 'AbortError') {
       return { success: false, error: 'Twitter API request timed out (30s).' }
     }
-    console.error('[fetchTwitterUserInfo]', e)
     return { success: false, error: e instanceof Error ? e.message : 'Unknown error' }
   }
 }
@@ -123,6 +124,9 @@ async function fetchTwitterNetwork(
   if (!handle) return { success: false, error: 'Could not parse a Twitter handle from that input.' }
 
   try {
+    // twitterapi.io exposes /twitter/user/followers and /twitter/user/followings.
+    // The followings endpoint returns `followings` (not `following`) in the
+    // body; the response is otherwise the same shape.
     const path = side === 'followers' ? '/twitter/user/followers' : '/twitter/user/followings'
     const url = new URL(`${BASE}${path}`)
     url.searchParams.set('userName', handle)
@@ -164,6 +168,9 @@ async function fetchTwitterNetwork(
       next_cursor?: string
     }
 
+    // twitterapi.io returns `followers` for the followers endpoint and
+    // `followings` for the following endpoint. Tolerate `users`/`data` as
+    // generic fallbacks against schema drift.
     const list: RawUser[] =
       data.followers ?? data.followings ?? data.users ?? data.data ?? []
 
@@ -185,7 +192,6 @@ async function fetchTwitterNetwork(
     if (e instanceof Error && e.name === 'AbortError') {
       return { success: false, error: 'Twitter API request timed out (30s).' }
     }
-    console.error('[fetchTwitterNetwork]', e)
     return { success: false, error: e instanceof Error ? e.message : 'Unknown error' }
   }
 }

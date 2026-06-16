@@ -53,52 +53,6 @@ function normalizeForCache(input: string): string {
   return s.split('/')[0].split('?')[0].split('#')[0].toLowerCase()
 }
 
-const PRESETS: Array<{ id: string; label: string; text: string }> = [
-  {
-    id: 'founders',
-    label: 'Founders',
-    text: DEFAULT_FOUNDER_CRITERIA,
-  },
-  {
-    id: 'brand-name',
-    label: 'Brand-name founders only',
-    text: `Founders / co-founders of name-brand companies that almost anyone in tech would recognize by company name on the spot.
-
-- 95-100: Founder / co-founder of Hugging Face, Stripe, Notion, Vercel, Anthropic, OpenAI, Figma, Linear, Supabase, Replit, Cursor, Perplexity, Lovable, Cloudflare, Airtable, Discord, or a peer of these. Bio explicitly names a household-tech company OR the person's name is famous as that founder.
-- 80-94: Founder / co-founder of a clearly funded, named-in-bio company that is "kind of well known" but not a household name (Series A+ generally). Bio names the company.
-- 40-79: Founder of a real but lesser-known startup. Bio names a company you've never heard of.
-- 0-39: Not a founder of a recognizable / fundable company. EVEN IF very famous, very verified, or with millions of followers. Hard-cap to under 40.
-
-This is the strictest preset. Err on the side of LOW scores — only obvious name-brand-company founders should clear 90.`,
-  },
-  {
-    id: 'ai-dev',
-    label: 'AI / dev-tool founders',
-    text: `Founders / co-founders of AI, developer-tool, or infrastructure companies. Things like LLMs, AI products, dev tools, databases, hosting, APIs, IDEs, agents, vector stores, eval platforms.
-
-- 90-100: Founder of a known AI or dev-infra company (Anthropic, OpenAI, Hugging Face, LangChain, Vercel, Supabase, Replit, Cursor, Lovable, Composio, Linear, Inngest, Modal, Pinecone, Cohere, Mistral, etc.).
-- 70-89: Founder of a real funded AI / dev startup, bio names the company, looks YC-shaped.
-- 50-69: Indie AI / dev founder.
-- 0-49: Not an AI / dev / infra founder.
-
-Strongly downweight: AI-influencer types ("AI thought leader", "AI strategist", growth-coach-shaped bios that mention AI but don't name a product) — those are not founders of AI products.`,
-  },
-  {
-    id: 'crypto',
-    label: 'Crypto founders',
-    text: `Founders / co-founders of crypto / web3 / DeFi / NFT companies, protocols, or DAOs.
-
-- 90-100: Founder of a known crypto company / protocol (a16z crypto portfolio, top-50-by-TVL DeFi protocols, well-known L1s/L2s, well-known NFT brands).
-- 70-89: Founder of a real funded crypto startup, bio names the product/protocol.
-- 50-69: Indie crypto founder / project lead.
-- 0-49: Not a crypto founder. Influencers, traders, "crypto coaches" hard-cap under 40 even if very famous.`,
-  },
-  {
-    id: 'custom',
-    label: 'Custom (edit below)',
-    text: '',
-  },
-]
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -177,6 +131,12 @@ export default function TwitterNetworkPage() {
   const [handle, setHandle] = useState('')
   const [side, setSide] = useState<'followers' | 'following'>('followers')
   const [filter, setFilter] = useState('')
+  // DOM rendering ~20k rows tanks the page (~5-10s tax on every paint
+  // + slow filter typing). Cap the rendered slice; user can expand if
+  // they want to scroll past the top matches. Sorted-by-score means
+  // the visible cap = the most relevant N anyway.
+  const [renderCap, setRenderCap] = useState(500)
+  const RENDER_CAP_DEFAULT = 500
   const [ceosOnly, setCeosOnly] = useState(false)
   const [verifiedOnly, setVerifiedOnly] = useState(false)
   const [scoredOnly, setScoredOnly] = useState(false)
@@ -220,6 +180,14 @@ export default function TwitterNetworkPage() {
   // baseline.
   const lastServerSavedLenRef = useRef(0)
   const lastServerSavedKeyRef = useRef<string>('')
+  // Tracks which (normalized handle, side) the in-memory users/scores
+  // belong to. Updated whenever state is freshly loaded or restored.
+  // The auto-save effect refuses to write when this doesn't match the
+  // current typed handle — otherwise typing a new handle while a prior
+  // run is still in memory would persist the OLD run under the NEW
+  // handle's key (the original "emily_yu shows 19,670 jia_seed
+  // followers" bug).
+  const runKeyRef = useRef<string>('')
   const sentinelRef = useRef<HTMLDivElement | null>(null)
   // Ref-mirror of `side` so the one-click pipeline can flip "followers"
   // synchronously before kicking the fetch, even though the corresponding
@@ -562,6 +530,10 @@ export default function TwitterNetworkPage() {
     scoringCancelRef.current = false
     setError(null)
     setLastCriteriaUsed(criteria)
+    // Stamp the run key so the auto-save effect knows the in-memory
+    // state now belongs to this (handle, side). Without this, a fresh
+    // load before any successful save would let stale state leak.
+    runKeyRef.current = `${normalizeForCache(handle)}:followers`
     // Reset the run-scoped tally so the progress line starts at zero.
     setCacheHitCount(0)
     setClaudeCallCount(0)
@@ -879,6 +851,28 @@ export default function TwitterNetworkPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasNext, loading, autoLoading])
 
+  // Wipe in-memory state when the typed handle no longer matches the
+  // run it belongs to. Without this, the auto-save effect would persist
+  // the prior run's users[] under the freshly-typed handle's cache key.
+  useEffect(() => {
+    const normalized = normalizeForCache(handle)
+    const currentKey = normalized ? `${normalized}:${side}` : ''
+    if (!runKeyRef.current) return
+    if (runKeyRef.current === currentKey) return
+    setUsers([])
+    setScores(new Map())
+    setSourceUser(null)
+    setCursor(null)
+    setHasNext(false)
+    setScoredCount(0)
+    setCacheHitCount(0)
+    setClaudeCallCount(0)
+    setLastCriteriaUsed(null)
+    runKeyRef.current = ''
+    lastServerSavedLenRef.current = 0
+    lastServerSavedKeyRef.current = ''
+  }, [handle, side])
+
   // Load the recent-runs list on mount. Merge local IDB + per-user
   // server runs so cross-device runs surface as long as the user is
   // signed in. Dedupe on (handle, side); keep the freshest by
@@ -922,6 +916,13 @@ export default function TwitterNetworkPage() {
   useEffect(() => {
     const normalized = normalizeForCache(handle)
     if (!normalized || users.length === 0) return
+
+    // Don't persist if the in-memory state belongs to a different run
+    // than the currently typed handle. Prevents the original bug where
+    // typing a new handle while a prior run was loaded saved the OLD
+    // users[] under the NEW handle's cache key.
+    const currentKey = `${normalized}:${side}`
+    if (runKeyRef.current && runKeyRef.current !== currentKey) return
 
     // IDB write (always tried unless cache is disabled). Cheap and
     // fast — runs every settled state change.
@@ -1063,6 +1064,7 @@ export default function TwitterNetworkPage() {
       // once we've actually grown the list beyond what's already saved.
       lastServerSavedLenRef.current = chosen.users.length
       lastServerSavedKeyRef.current = `${normalized}:${side}`
+      runKeyRef.current = `${normalized}:${side}`
       if (chosen.scores.length > 0) setSortBy('score')
     })()
     return () => {
@@ -1130,13 +1132,13 @@ export default function TwitterNetworkPage() {
           )}
         </div>
         <p className="text-muted-foreground max-w-2xl text-base font-light">
-          Pull the followers of any Twitter account via twitterapi.io. Filter the
-          list locally for founders / CEOs.
+          Pull the followers of any Twitter account and see who the best people
+          following you are.
         </p>
       </div>
 
       {runs.length > 0 && (
-        <div className="space-y-2 rounded-md border bg-muted/40 p-3">
+        <div className="space-y-2 rounded-md border p-3">
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground text-xs font-light">
               Recent runs
@@ -1231,7 +1233,7 @@ export default function TwitterNetworkPage() {
       <form
         onSubmit={(e) => {
           e.preventDefault()
-          void startFresh()
+          void findBestFollowers()
         }}
         className="space-y-3"
       >
@@ -1243,198 +1245,90 @@ export default function TwitterNetworkPage() {
             className="flex-1"
             disabled={loading || autoLoading || scoring}
           />
-          <Button
-            type="submit"
-            disabled={loading || autoLoading || scoring || !handle.trim()}
-          >
-            {loading && users.length === 0
-              ? 'Loading...'
-              : `Load ${side === 'following' ? 'following' : 'followers'}`}
-          </Button>
-        </div>
-        <div className="flex gap-4 text-sm">
-          <label className="flex items-center gap-2">
-            <input
-              type="radio"
-              name="side"
-              value="followers"
-              checked={side === 'followers'}
-              onChange={() => setSide('followers')}
-              disabled={loading || autoLoading || scoring}
-            />
-            Their followers
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="radio"
-              name="side"
-              value="following"
-              checked={side === 'following'}
-              onChange={() => setSide('following')}
-              disabled={loading || autoLoading || scoring}
-            />
-            Who they follow
-          </label>
-        </div>
-      </form>
-
-      <div className="space-y-3 rounded-md border border-dashed p-4">
-        <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <p className="text-foreground text-base font-light">
-              Find {presetId === 'brand-name'
-                ? 'brand-name founders'
-                : presetId === 'ai-dev'
-                  ? 'AI / dev-tool founders'
-                  : presetId === 'crypto'
-                    ? 'crypto founders'
-                    : presetId === 'custom'
-                      ? 'matches'
-                      : 'founders'}{' '}
-              following you
-            </p>
-            <p className="text-muted-foreground mt-1 text-xs font-light">
-              One click: pulls every follower, scores each one against
-              the criteria below with Claude, sorts by score. ~5 min and
-              ~$0.75 for a 19k-follower account.
-            </p>
-          </div>
           {!loading && !autoLoading && !scoring ? (
             <Button
-              type="button"
-              onClick={() => void findBestFollowers()}
+              type="submit"
               disabled={!handle.trim() || !criteria.trim()}
-              className="w-full sm:w-auto"
             >
-              Find {presetId === 'custom' ? 'matches' : presetId === 'founders' ? 'founders' : presetId === 'brand-name' ? 'brand names' : presetId.split('-')[0]}
+              See my best followers
             </Button>
           ) : (
             <Button
               type="button"
-              variant="secondary"
+              variant="outline"
               onClick={() => {
                 cancelRef.current = true
                 scoringCancelRef.current = true
               }}
-              className="w-full sm:w-auto"
             >
               {scoring
-                ? `Cancel scoring (${scoredCount.toLocaleString()} / ${users.length.toLocaleString()})`
-                : autoLoading
-                  ? `Cancel pulling (${users.length.toLocaleString()} loaded)`
-                  : 'Cancel'}
+                ? `Cancel · ${scoredCount.toLocaleString()} / ${users.length.toLocaleString()} scored`
+                : `Cancel · ${users.length.toLocaleString()} loaded`}
             </Button>
           )}
         </div>
+      </form>
 
-        <div className="flex flex-wrap gap-2">
-          {PRESETS.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              onClick={() => {
-                setPresetId(p.id)
-                if (p.id !== 'custom') setCriteria(p.text)
-              }}
-              disabled={loading || autoLoading || scoring}
-              className={`rounded-full border px-3 py-1 text-xs transition ${
-                presetId === p.id
-                  ? 'border-foreground bg-foreground text-background'
-                  : 'border-border bg-background hover:bg-accent'
-              } disabled:opacity-50`}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
-
-        <details className="text-sm" open={presetId === 'custom'}>
-          <summary className="text-muted-foreground cursor-pointer text-xs select-none">
-            What to look for (Claude reads this verbatim) — {criteria.length}{' '}
-            chars
-          </summary>
-          <textarea
-            value={criteria}
-            onChange={(e) => {
-              setCriteria(e.target.value)
-              setPresetId('custom')
-            }}
-            disabled={loading || autoLoading || scoring}
-            rows={8}
-            className="border-border bg-background mt-2 w-full rounded-md border p-3 font-mono text-xs"
-            placeholder="Describe who you're hunting for. E.g. 'Founders of YC-backed AI companies, especially the AI-research labs everyone's heard of.'"
-          />
-        </details>
-      </div>
-
-      {sourceUser && (
-        <div className="bg-muted/40 flex items-start gap-4 rounded-md border p-4">
-          {sourceUser.profilePicture && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={sourceUser.profilePicture}
-              alt={sourceUser.userName}
-              className="h-12 w-12 flex-shrink-0 rounded-full object-cover"
-            />
-          )}
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-              <span className="text-foreground font-light">{sourceUser.name}</span>
-              <span className="text-muted-foreground text-sm font-light">
-                @{sourceUser.userName}
-              </span>
-              {(() => {
-                const s = scores.get(sourceUser.userName)
-                if (!s) return null
-                return (
-                  <span
-                    className="border-border text-foreground rounded-full border bg-transparent px-2 py-0.5 text-xs font-light"
-                    title={s.reason}
-                  >
-                    {s.score} · {s.role || 'unrated'}
+      {(sourceUser || users.length > 0) && (
+        <div className="flex flex-wrap items-center gap-4 rounded-md border p-4">
+          {sourceUser && (
+            <div className="flex min-w-0 items-center gap-3">
+              {sourceUser.profilePicture && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={sourceUser.profilePicture}
+                  alt={sourceUser.userName}
+                  className="h-12 w-12 flex-shrink-0 rounded-full object-cover"
+                />
+              )}
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                  <span className="text-foreground font-light">
+                    {sourceUser.name}
                   </span>
-                )
-              })()}
+                  <span className="text-muted-foreground text-sm font-light">
+                    @{sourceUser.userName}
+                  </span>
+                  {(() => {
+                    const s = scores.get(sourceUser.userName)
+                    if (!s) return null
+                    return (
+                      <span
+                        className="border-border text-foreground rounded-full border bg-transparent px-2 py-0.5 text-xs font-light"
+                        title={s.reason}
+                      >
+                        {s.score} · {s.role || 'unrated'}
+                      </span>
+                    )
+                  })()}
+                </div>
+                <div className="text-muted-foreground mt-0.5 flex flex-wrap gap-x-3 text-xs font-light">
+                  <span>
+                    <span className="text-foreground">
+                      {formatNumber(sourceUser.followers)}
+                    </span>{' '}
+                    followers
+                  </span>
+                  <span>{formatNumber(sourceUser.following)} following</span>
+                  {sourceUser.location && <span>{sourceUser.location}</span>}
+                </div>
+              </div>
             </div>
-            <div className="text-muted-foreground mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs font-light">
-              <span>
-                <span className="text-foreground">
-                  {formatNumber(sourceUser.followers)}
-                </span>{' '}
-                followers on Twitter
-              </span>
-              <span>
-                {formatNumber(sourceUser.following)} following
-              </span>
-              {sourceUser.location && <span>{sourceUser.location}</span>}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {users.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2">
-          {!scoring ? (
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={() => void scoreAllLoaded()}
-              disabled={loading || autoLoading}
-            >
-              {scores.size > 0
-                ? `Score ${(users.length - scores.size).toLocaleString()} unscored with Claude`
-                : `Score ${users.length.toLocaleString()} loaded with Claude`}
-            </Button>
-          ) : (
-            <Button
-              type="button"
-              variant="secondary"
-              onClick={cancelScoring}
-            >
-              Cancel scoring ({scoredCount.toLocaleString()} / {users.length.toLocaleString()})
-            </Button>
           )}
-          {scores.size > 0 && !scoring && (
+          {users.length > 0 && (
+            <div className="flex min-w-0 flex-col">
+              <span className="text-foreground text-xl font-light">
+                {users.length.toLocaleString()}
+              </span>
+              <span className="text-muted-foreground text-xs font-light">
+                loaded
+                {sourceUser
+                  ? ` / ${sourceUser.followers.toLocaleString()} total`
+                  : ''}
+              </span>
+            </div>
+          )}
+          {users.length > 0 && scores.size > 0 && !scoring && (
             <Button
               type="button"
               variant="outline"
@@ -1444,152 +1338,38 @@ export default function TwitterNetworkPage() {
               Download CSV ({scores.size.toLocaleString()} scored)
             </Button>
           )}
-          {scoring && (
-            <span className="text-muted-foreground text-xs font-light">
-              Claude Haiku, batches of {TWITTER_SCORE_BATCH_SIZE},{' '}
-              {SCORE_PARALLELISM} in flight
-              {cacheHitCount > 0 || claudeCallCount > 0
-                ? ` · ${cacheHitCount.toLocaleString()} from cache, ${claudeCallCount.toLocaleString()} via Claude`
-                : ''}
+          {users.length > 0 && (
+            <span className="text-muted-foreground ml-auto text-sm font-light">
+              {scoring && (cacheHitCount > 0 || claudeCallCount > 0)
+                ? `${cacheHitCount.toLocaleString()} cached · ${claudeCallCount.toLocaleString()} scored`
+                : !scoring && (cacheHitCount > 0 || claudeCallCount > 0)
+                  ? `This run: ${cacheHitCount.toLocaleString()} cached · ${claudeCallCount.toLocaleString()} freshly scored`
+                  : `${visible.length} of ${users.length} loaded${hasNext ? ' (more available)' : ''}`}
             </span>
           )}
-          {!scoring && (cacheHitCount > 0 || claudeCallCount > 0) && (
-            <span className="text-muted-foreground text-xs font-light">
-              This run: {cacheHitCount.toLocaleString()} from cache,{' '}
-              {claudeCallCount.toLocaleString()} via Claude
-            </span>
-          )}
-        </div>
-      )}
-
-      {users.length > 0 && (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <div className="rounded-md border p-3">
-            <div className="text-foreground text-2xl font-light">
-              {users.length.toLocaleString()}
-            </div>
-            <div className="text-muted-foreground text-xs font-light">
-              loaded
-              {sourceUser
-                ? ` / ${sourceUser.followers.toLocaleString()} total`
-                : ''}
-            </div>
-          </div>
-          <div className="rounded-md border p-3">
-            <div className="text-foreground text-2xl font-light">
-              {(stats.verified + stats.blueVerified).toLocaleString()}
-            </div>
-            <div className="text-muted-foreground text-xs font-light">
-              verified (legacy + blue)
-            </div>
-          </div>
-          <div className="rounded-md border p-3">
-            <div className="text-foreground text-2xl font-light">{stats.verified}</div>
-            <div className="text-muted-foreground text-xs font-light">legacy verified</div>
-          </div>
-          <div className="rounded-md border p-3">
-            <div className="text-foreground text-2xl font-light">
-              {stats.founders.toLocaleString()}
-            </div>
-            <div className="text-muted-foreground text-xs font-light">
-              founder-language bios
-            </div>
-          </div>
         </div>
       )}
 
       {error && (
-        <div className="border-border bg-muted/40 text-foreground rounded-md border p-3 text-sm font-light">
+        <div className="border-border text-foreground rounded-md border p-3 text-sm font-light">
           {error}
         </div>
       )}
 
       {users.length > 0 && (
-        <div className="flex flex-wrap items-center gap-3">
-          <Input
-            placeholder="Filter name / handle / bio"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            className="max-w-xs"
-          />
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox
-              checked={ceosOnly}
-              onCheckedChange={(v) => setCeosOnly(Boolean(v))}
-            />
-            Founders / CEOs only
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox
-              checked={verifiedOnly}
-              onCheckedChange={(v) => setVerifiedOnly(Boolean(v))}
-            />
-            Verified only
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox
-              checked={sortBy === 'followers'}
-              onCheckedChange={(v) =>
-                setSortBy(Boolean(v) ? 'followers' : 'order')
-              }
-            />
-            Sort by follower count
-          </label>
-          {scores.size > 0 && (
-            <>
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  checked={scoredOnly}
-                  onCheckedChange={(v) => setScoredOnly(Boolean(v))}
-                />
-                Scored only
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  checked={sortBy === 'score'}
-                  onCheckedChange={(v) =>
-                    setSortBy(Boolean(v) ? 'score' : 'order')
-                  }
-                />
-                Sort by Claude score
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <span>Min score</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={100}
-                  value={minScore}
-                  onChange={(e) =>
-                    setMinScore(
-                      Math.max(0, Math.min(100, Number(e.target.value) || 0)),
-                    )
-                  }
-                  className="border-border bg-background w-16 rounded-md border px-2 py-1 text-sm"
-                />
-                {[90, 80, 70].map((n) => (
-                  <button
-                    key={n}
-                    type="button"
-                    onClick={() => setMinScore(n)}
-                    className="text-muted-foreground hover:text-foreground text-xs underline"
-                  >
-                    {n}+
-                  </button>
-                ))}
-              </label>
-            </>
-          )}
-          <span className="text-muted-foreground ml-auto text-sm">
-            {visible.length} of {users.length} loaded
-            {hasNext ? ' (more available)' : ''}
-          </span>
-        </div>
+        <Input
+          placeholder="Filter name / handle / bio"
+          value={filter}
+          onChange={(e) => {
+            setFilter(e.target.value)
+            setRenderCap(RENDER_CAP_DEFAULT)
+          }}
+        />
       )}
 
       {visible.length > 0 && (
         <div className="divide-border bg-background divide-y rounded-md border">
-          {visible.map((u) => (
+          {visible.slice(0, renderCap).map((u) => (
             <div key={u.id || u.userName} className="flex items-start gap-4 p-4">
               {u.profilePicture ? (
                 // eslint-disable-next-line @next/next/no-img-element
@@ -1658,6 +1438,28 @@ export default function TwitterNetworkPage() {
         </div>
       )}
 
+      {visible.length > renderCap && (
+        <div className="flex items-center justify-center gap-3 py-2">
+          <span className="text-muted-foreground text-xs font-light">
+            Showing top {renderCap.toLocaleString()} of {visible.length.toLocaleString()}
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setRenderCap((n) => n + 500)}
+          >
+            Show 500 more
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setRenderCap(visible.length)}
+          >
+            Show all
+          </Button>
+        </div>
+      )}
+
       {/* Sentinel for infinite scroll. Sits just above the action row so
           the IntersectionObserver fires as the user nears the bottom. */}
       {users.length > 0 && (
@@ -1678,7 +1480,7 @@ export default function TwitterNetworkPage() {
         <div className="flex flex-wrap gap-2">
           <Button
             type="button"
-            variant="secondary"
+            variant="outline"
             onClick={() => void loadNextPage()}
             disabled={loading || autoLoading}
           >
@@ -1687,7 +1489,7 @@ export default function TwitterNetworkPage() {
           {!autoLoading ? (
             <Button
               type="button"
-              variant="secondary"
+              variant="outline"
               onClick={() => void loadAll()}
               disabled={loading}
             >
@@ -1696,7 +1498,7 @@ export default function TwitterNetworkPage() {
           ) : (
             <Button
               type="button"
-              variant="secondary"
+              variant="outline"
               onClick={cancelAutoLoad}
             >
               Cancel ({users.length.toLocaleString()} loaded...)
