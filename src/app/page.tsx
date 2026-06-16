@@ -1116,7 +1116,43 @@ export default function TwitterNetworkPage() {
   }, [users])
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6 p-8">
+    <div className="animate-in fade-in relative min-h-screen duration-300">
+      {/* Background lifted from the GEO dashboard: a fixed image anchored
+          to the bottom of the viewport with a fading gradient overlay,
+          so content above it stays legible while the bottom of the page
+          carries the same visual signature as the rest of the app. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-x-0 bottom-[-12vh] z-0 h-[38vh] overflow-hidden"
+      >
+        <div
+          className="absolute -inset-[5%] dark:hidden"
+          style={{
+            backgroundImage: 'url(/landing/geo-bg.png)',
+            backgroundSize: 'cover',
+            backgroundPosition: 'center bottom',
+            backgroundRepeat: 'no-repeat',
+          }}
+        />
+        <div
+          className="absolute -inset-[5%] hidden [filter:saturate(0.25)] dark:block"
+          style={{
+            backgroundImage: 'url(/landing/main-demo-bg-dark.jpg)',
+            backgroundSize: 'cover',
+            backgroundPosition: 'center bottom',
+            backgroundRepeat: 'no-repeat',
+          }}
+        />
+        <div
+          className="absolute inset-0"
+          style={{
+            backgroundImage:
+              'linear-gradient(to bottom, var(--background) 0%, color-mix(in oklch, var(--background) 96%, transparent) 18%, color-mix(in oklch, var(--background) 76%, transparent) 42%, color-mix(in oklch, var(--background) 36%, transparent) 70%, transparent 100%)',
+          }}
+        />
+      </div>
+
+      <div className="relative z-10 mx-auto max-w-5xl space-y-6 p-8">
       <div className="space-y-2 pt-16 text-center">
         <div className="flex flex-wrap items-baseline justify-center gap-x-3 gap-y-1">
           <h1 className="text-foreground text-3xl leading-tight font-light sm:text-4xl">
@@ -1512,6 +1548,7 @@ export default function TwitterNetworkPage() {
           )}
         </div>
       )}
+      </div>
     </div>
   )
 }
