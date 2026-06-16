@@ -1117,10 +1117,10 @@ export default function TwitterNetworkPage() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6 p-8">
-      <div className="space-y-2">
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+      <div className="space-y-2 pt-16 text-center">
+        <div className="flex flex-wrap items-baseline justify-center gap-x-3 gap-y-1">
           <h1 className="text-foreground text-3xl leading-tight font-light sm:text-4xl">
-            Twitter network
+            Twitter Network
           </h1>
           {cacheDisabled && (
             <span
@@ -1131,7 +1131,7 @@ export default function TwitterNetworkPage() {
             </span>
           )}
         </div>
-        <p className="text-muted-foreground max-w-2xl text-base font-light">
+        <p className="text-muted-foreground mx-auto max-w-2xl text-base font-light">
           Pull the followers of any Twitter account and see who the best people
           following you are.
         </p>
